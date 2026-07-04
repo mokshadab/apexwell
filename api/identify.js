@@ -1,18 +1,11 @@
 // api/identify.js — Vercel serverless function.
 // Species identification via Claude Haiku Vision. NATURE domain only.
-//
-// Called by CaptureMode with: { image: base64String, mimeType: string }
-// Returns JSON: { species, scientificName, confidence, habitat, interesting }
-//
-// The ANTHROPIC_API_KEY lives ONLY in Vercel environment variables —
-// never in the browser bundle (Section 27.1). This function is the
-// boundary: the browser sends a photo, the server calls Claude.
+// Robust JSON extraction: pulls the JSON object out of Claude's reply
+// even if it is wrapped in prose or markdown fences.
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const MODEL = 'claude-haiku-4-5';
 
-// Safe fallback returned when identification cannot be completed.
-// CaptureMode still saves the discovery — the student names it herself.
 const FALLBACK = {
   species: 'Unidentified',
   scientificName: '',
@@ -29,8 +22,7 @@ export default async function handler(req, res) {
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    // Misconfiguration — return fallback so the app never blocks.
-    res.status(200).json(FALLBACK);
+    res.status(200).json({ ...FALLBACK, _debug: 'no_api_key' });
     return;
   }
 
@@ -45,18 +37,16 @@ export default async function handler(req, res) {
   const systemPrompt =
     'You are helping a 15-year-old student naturalist in North Carolina ' +
     'identify organisms she photographs in the field. Be accurate and ' +
-    'encouraging. Always attempt identification even if unsure.';
+    'encouraging. Always attempt identification even if unsure. ' +
+    'Respond with ONLY a JSON object, no other text.';
 
   const userText =
-    'Identify this organism. Return ONLY valid JSON:\n' +
-    '{\n' +
-    '  "species": "common name",\n' +
-    '  "scientificName": "Genus species",\n' +
-    '  "confidence": 85,\n' +
-    '  "habitat": "Wetland | Forest edge | Mixed | Shoreline | Open field | Urban garden",\n' +
-    '  "interesting": "one sentence ecological significance"\n' +
-    '}\n' +
-    'Never refuse. Always return this structure. Low confidence if unsure.';
+    'Identify this organism. Return ONLY valid JSON in exactly this shape:\n' +
+    '{"species":"common name","scientificName":"Genus species",' +
+    '"confidence":85,"habitat":"Wetland",' +
+    '"interesting":"one sentence ecological significance"}\n' +
+    'Never refuse. Always return this structure. Use a low confidence ' +
+    'number if unsure. Do not wrap the JSON in markdown or add any words.';
 
   try {
     const controller = new AbortController();
@@ -72,7 +62,7 @@ export default async function handler(req, res) {
       signal: controller.signal,
       body: JSON.stringify({
         model: MODEL,
-        max_tokens: 300,
+        max_tokens: 400,
         system: systemPrompt,
         messages: [
           {
@@ -80,11 +70,7 @@ export default async function handler(req, res) {
             content: [
               {
                 type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: media,
-                  data: image,
-                },
+                source: { type: 'base64', media_type: media, data: image },
               },
               { type: 'text', text: userText },
             ],
@@ -96,31 +82,49 @@ export default async function handler(req, res) {
     clearTimeout(timeout);
 
     if (!response.ok) {
-      res.status(200).json(FALLBACK);
+      const errText = await response.text().catch(() => '');
+      res.status(200).json({
+        ...FALLBACK,
+        _debug: `api_${response.status}`,
+        _detail: errText.slice(0, 200),
+      });
       return;
     }
 
     const data = await response.json();
 
-    // Extract the text block from Claude's response.
     const textBlock =
       Array.isArray(data.content) &&
       data.content.find((b) => b.type === 'text');
     const raw = textBlock ? textBlock.text : '';
 
-    // Parse the JSON Claude returned. Strip accidental code fences.
-    const cleaned = raw.replace(/```json|```/g, '').trim();
-    let parsed;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch {
-      res.status(200).json(FALLBACK);
+    // Robust extraction: find the first { ... } object in the text.
+    let parsed = null;
+    const start = raw.indexOf('{');
+    const end = raw.lastIndexOf('}');
+    if (start !== -1 && end !== -1 && end > start) {
+      const candidate = raw.slice(start, end + 1);
+      try {
+        parsed = JSON.parse(candidate);
+      } catch {
+        parsed = null;
+      }
+    }
+
+    if (!parsed) {
+      res.status(200).json({
+        ...FALLBACK,
+        _debug: 'parse_failed',
+        _detail: raw.slice(0, 200),
+      });
       return;
     }
 
-    // Normalize and clamp, so the client always gets a safe shape.
     const result = {
-      species: typeof parsed.species === 'string' ? parsed.species : FALLBACK.species,
+      species:
+        typeof parsed.species === 'string' && parsed.species.trim()
+          ? parsed.species.trim()
+          : FALLBACK.species,
       scientificName:
         typeof parsed.scientificName === 'string' ? parsed.scientificName : '',
       confidence:
@@ -128,13 +132,14 @@ export default async function handler(req, res) {
           ? Math.max(0, Math.min(100, Math.round(parsed.confidence)))
           : 0,
       habitat: typeof parsed.habitat === 'string' ? parsed.habitat : 'Mixed',
-      interesting: typeof parsed.interesting === 'string' ? parsed.interesting : '',
+      interesting:
+        typeof parsed.interesting === 'string' ? parsed.interesting : '',
     };
 
     res.status(200).json(result);
-  } catch {
-    // Timeout or network error — never block the capture flow.
-    res.status(200).json(FALLBACK);
+  } catch (err) {
+    res.status(200).json({ ...FALLBACK, _debug: 'exception', _detail: String(err).slice(0, 200) });
+    return;
   }
 }
 
